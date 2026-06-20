@@ -434,6 +434,11 @@ class InstagramBruteforcer:
 
         status = result.get("status")
 
+        # Per-attempt visibility (shown with --verbose). Surfaces csrf/timeout/
+        # block errors that the periodic summary below would otherwise hide.
+        detail = result.get("message", "")
+        log.debug(f"[#{idx}] {status}{(' - ' + detail) if detail else ''} | pw={password[:20]}")
+
         if status == "success":
             self.found = True
             print(f"\n{'=' * 50}")
