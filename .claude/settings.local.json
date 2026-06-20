@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(if \\(-not $?\\) { \"NOT A REPO\" })",
+      "PowerShell(git init)",
+      "PowerShell(git add -A)"
+    ]
+  }
+}
